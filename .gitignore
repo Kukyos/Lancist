@@ -1,0 +1,36 @@
+# --- python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.Python
+*.egg-info/
+.pytest_cache/
+
+# --- pyinstaller build artifacts ---
+build/
+dist/
+*.spec.bak
+
+# --- app runtime data (per-user, not source) ---
+config.json
+leads.json
+emails.csv
+demos/
+*.log
+
+# --- secrets, just in case ---
+.env
+*.pem
+*.key
+
+# --- editors / OS ---
+.vscode/
+.idea/
+.claude/
+*.swp
+.DS_Store
+Thumbs.db

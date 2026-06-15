@@ -1,0 +1,7 @@
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+customtkinter>=5.2.0
+anthropic>=0.39.0
+pillow>=10.0
+# build-only (auto-installed by build.ps1):
+# pyinstaller>=6.0
