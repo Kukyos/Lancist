@@ -1,103 +1,42 @@
 """
-Lead finder — scour the web for small-business websites worth pitching to.
+Lead finder — find SMB websites by querying OpenStreetMap directly.
 
-We use DuckDuckGo's HTML endpoint (https://duckduckgo.com/html/) because:
-  - no API key
-  - no JS rendering required
-  - works behind plain `requests`
-  - rate limits are forgiving for a few queries at a time
+Why OSM instead of Bing/DDG scraping?
+  - search engines return news, dictionaries, and aggregator spam
+  - OSM has structured business listings: name, address, website, phone
+  - free, no API key, no per-query cost
+  - "every dentist within 5km of point X" is a one-shot query (Overpass)
 
-For India-focused work we:
-  - bias queries toward `site:.in` and append the city/region
-  - skip well-known aggregator/directory domains (JustDial, Sulekha,
-    IndiaMART, Yelp, Google Maps, Facebook pages, etc.)
-  - try to pick the homepage (strip /about, /contact, deep paths) for each hit
+Stack:
+  - geolocate_ip()    -> ipapi.co (free, no key, ~1000 req/day)
+  - geocode_place()   -> Nominatim (OSM's free geocoder, 1 req/sec polite)
+  - find_nearby()     -> Overpass API (free, no key, queries OSM tag DB)
 
-The output is a list of partial-lead dicts ready to be enriched by `scrape()`.
+All three require a polite User-Agent that identifies the app.
+
+Public surface kept compatible with the old finder so main.py only needs
+small changes:
+  - dataclasses FoundLead, FindResult
+  - class Finder (now takes lat/lng/radius/category instead of city/text)
 """
 from __future__ import annotations
 
-import re
+import math
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
-from urllib.parse import quote_plus, urlparse, parse_qs, unquote
+from urllib.parse import urlparse
 
 import requests
-from bs4 import BeautifulSoup
 
 
-# domains we drop (aggregators, directories, social, marketplaces, big media)
-SKIP_DOMAINS = {
-    # directories / aggregators
-    "justdial.com", "sulekha.com", "indiamart.com", "tradeindia.com",
-    "yelp.com", "yellowpages.in", "askme.com", "olx.in",
-    "urbancompany.com", "urbanclap.com", "bookmyshow.com",
-    # search engines & maps
-    "google.com", "google.co.in", "maps.google.com",
-    "bing.com", "duckduckgo.com", "yahoo.com",
-    # social
-    "facebook.com", "m.facebook.com", "instagram.com", "twitter.com",
-    "x.com", "linkedin.com", "youtube.com", "pinterest.com",
-    "tiktok.com", "snapchat.com", "telegram.org",
-    # travel & food aggregators
-    "tripadvisor.com", "tripadvisor.in", "zomato.com", "swiggy.com",
-    "makemytrip.com", "goibibo.com", "booking.com", "airbnb.com",
-    "agoda.com", "expedia.com",
-    # marketplaces
-    "amazon.com", "amazon.in", "flipkart.com", "myntra.com", "ajio.com",
-    "snapdeal.com", "shopify.com", "etsy.com",
-    # platform / DIY hosts (these are CMS landing pages, not businesses)
-    "wikipedia.org", "quora.com", "reddit.com", "medium.com",
-    "blogspot.com", "wordpress.com", "wix.com", "weebly.com",
-    "carrd.co", "linktr.ee", "github.com", "stackoverflow.com",
-    "behance.net", "dribbble.com",
-    # large news / media — never a pitch target
-    "timesofindia.indiatimes.com", "indiatimes.com", "indianexpress.com",
-    "thehindu.com", "ndtv.com", "news18.com", "hindustantimes.com",
-    "livemint.com", "businesstoday.in", "economictimes.indiatimes.com",
-    "moneycontrol.com", "scroll.in", "thequint.com", "firstpost.com",
-    "healthline.com", "everydayhealth.com", "webmd.com", "mayoclinic.org",
-    "fitness.com", "menshealth.com", "womenshealthmag.com",
-    "harvard.edu", "stanford.edu", "mit.edu",
-    "forbes.com", "nytimes.com", "bbc.com", "cnn.com", "wsj.com",
-    "vogue.in", "vogue.com", "gq.com", "elle.com",
-    "fitindia.gov.in",  # gov campaign, not a business
-    # dictionaries / reference (false-positive magnets)
-    "merriam-webster.com", "dictionary.cambridge.org", "collinsdictionary.com",
-    "britannica.com", "wordreference.com", "thefreedictionary.com",
-    "vocabulary.com", "dictionary.com", "thesaurus.com", "lexico.com",
-    "yappe.in",  # itself an aggregator
-    # big-box retail
-    "bestbuy.com", "costco.com", "walmart.com", "target.com",
-    "ikea.com", "homedepot.com", "lowes.com",
-}
+# ---------------------------------------------------------------------------
+# politeness — every OSM service insists on a UA that identifies the app
+# ---------------------------------------------------------------------------
 
-# entire TLD families to skip
-SKIP_TLD_SUFFIXES = (
-    ".gov", ".gov.in", ".gov.uk", ".mil",
-    ".edu", ".edu.in", ".ac.in", ".ac.uk",
-)
-
-# city/region modifiers we'll allow as the trailing token
-INDIA_TOKENS_DEFAULT = "india"
-
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) "
-    "Gecko/20100101 Firefox/127.0"
-)
-HEADERS = {
-    "User-Agent": UA,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "DNT": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-}
+UA = "Lancist/0.1 (Oryn Outreach Bot; contact: amohamedarmaan@gmail.com)"
+HEADERS = {"User-Agent": UA, "Accept": "application/json"}
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +49,12 @@ class FoundLead:
     business_name: str
     description: str
     source_query: str
+    # new in v2 — populated when we know the location
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    address: str = ""
+    phone: str = ""
+    osm_id: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -117,6 +62,11 @@ class FoundLead:
             "business_name": self.business_name,
             "description":   self.description,
             "source_query":  self.source_query,
+            "lat":           self.lat,
+            "lng":           self.lng,
+            "address":       self.address,
+            "phone":         self.phone,
+            "osm_id":        self.osm_id,
             "status":        "new",
         }
 
@@ -126,101 +76,134 @@ class FindResult:
     leads: list[FoundLead] = field(default_factory=list)
     queries_run: list[str] = field(default_factory=list)
     errors:     list[str]  = field(default_factory=list)
+    # so the UI can show "23 places found in OSM, 11 had websites"
+    raw_count: int = 0
 
 
 # ---------------------------------------------------------------------------
-# query builders
+# category -> OSM tag selectors
 # ---------------------------------------------------------------------------
+# Each value is a list of (key, value) pairs OR'd together. OSM tag a place
+# might have multiple of these — that's fine, dedupe by id handles it.
+#
+# Reference: https://wiki.openstreetmap.org/wiki/Map_features
 
-def build_queries(category: str, city: str = "", country: str = "in") -> list[str]:
-    """
-    Build a handful of varied queries so we sweep more SMB sites than a
-    single search would return.
+CATEGORY_TAGS: dict[str, list[tuple[str, str]]] = {
+    # food & drink
+    "cafe":         [("amenity", "cafe")],
+    "restaurant":   [("amenity", "restaurant")],
+    "bakery":       [("shop", "bakery")],
+    "ice_cream":    [("amenity", "ice_cream")],
+    "bar_pub":      [("amenity", "bar"), ("amenity", "pub")],
+    # health
+    "dentist":      [("amenity", "dentist"), ("healthcare", "dentist")],
+    "doctor":       [("amenity", "doctors"), ("healthcare", "doctor")],
+    "clinic":       [("amenity", "clinic"), ("healthcare", "clinic")],
+    "pharmacy":     [("amenity", "pharmacy")],
+    "veterinary":   [("amenity", "veterinary")],
+    "physio":       [("healthcare", "physiotherapist")],
+    # beauty / fitness
+    "gym":          [("leisure", "fitness_centre"), ("sport", "fitness")],
+    "yoga":         [("sport", "yoga"), ("leisure", "fitness_centre")],
+    "salon":        [("shop", "hairdresser"), ("shop", "beauty")],
+    "spa":          [("leisure", "spa"), ("amenity", "spa")],
+    # services
+    "lawyer":       [("office", "lawyer")],
+    "accountant":   [("office", "accountant")],
+    "architect":    [("office", "architect")],
+    "real_estate":  [("office", "estate_agent")],
+    "moving":       [("office", "moving_company")],
+    "car_repair":   [("shop", "car_repair")],
+    "car_rental":   [("amenity", "car_rental")],
+    "tailor":       [("shop", "tailor")],
+    # retail (small enough to be SMB pitchable)
+    "boutique":     [("shop", "boutique"), ("shop", "clothes")],
+    "jewellery":    [("shop", "jewelry")],
+    "florist":      [("shop", "florist")],
+    "bookshop":     [("shop", "books")],
+    # hospitality
+    "hotel":        [("tourism", "hotel")],
+    "guesthouse":   [("tourism", "guest_house")],
+    "hostel":       [("tourism", "hostel")],
+    # education-adjacent (private tutoring etc.)
+    "tutor":        [("amenity", "language_school"), ("amenity", "music_school")],
+    "driving_school": [("amenity", "driving_school")],
+}
 
-    We *don't* use the `site:.in` search operator — Bing/DDG often return
-    zero organic results for queries that include it. Instead we bias by
-    geography in the query text and filter by TLD on the result side
-    (see `_passes_country_filter`).
-    """
-    cat   = category.strip()
-    city  = (city or "").strip()
-    tld   = country.lower().strip()
-    place = city if city else (INDIA_TOKENS_DEFAULT if tld == "in" else "")
-
-    geo = f" {place}" if place else ""
-
-    # We deliberately avoid leading the query with "best" — search engines
-    # treat the word ambiguously and surface dictionary / electronics-store
-    # pages. We also avoid bare 1-word queries; specificity = better SMB hits.
-    # Three carefully-chosen query shapes give variety without triggering
-    # search-engine rate limits. Order matters — we run them in this order
-    # and stop early when max_results is reached.
-    seeds = []
-    if place:
-        seeds += [
-            f"{cat} in {place}",
-            f"{cat} {place} contact",
-            f"local {cat} {place}",
-        ]
-    else:
-        seeds += [
-            f"{cat} india",
-            f"{cat} india contact",
-            f"local {cat} india",
-        ]
-    # dedupe, preserve order
-    seen, out = set(), []
-    for s in seeds:
-        s = s.strip()
-        if s and s.lower() not in seen:
-            seen.add(s.lower()); out.append(s)
-    return out
+# pretty label used in the UI dropdown
+CATEGORY_LABELS: dict[str, str] = {
+    "cafe": "Cafe / Coffee shop",
+    "restaurant": "Restaurant",
+    "bakery": "Bakery",
+    "ice_cream": "Ice cream parlour",
+    "bar_pub": "Bar / Pub",
+    "dentist": "Dentist",
+    "doctor": "Doctor's clinic",
+    "clinic": "Multi-specialty clinic",
+    "pharmacy": "Pharmacy",
+    "veterinary": "Veterinary clinic",
+    "physio": "Physiotherapist",
+    "gym": "Gym / Fitness centre",
+    "yoga": "Yoga studio",
+    "salon": "Salon / Beauty parlour",
+    "spa": "Spa",
+    "lawyer": "Lawyer / Law firm",
+    "accountant": "Accountant / CA",
+    "architect": "Architect",
+    "real_estate": "Real estate agent",
+    "moving": "Movers / Packers",
+    "car_repair": "Car repair / Garage",
+    "car_rental": "Car rental",
+    "tailor": "Tailor",
+    "boutique": "Boutique / Clothing",
+    "jewellery": "Jeweller",
+    "florist": "Florist",
+    "bookshop": "Bookshop",
+    "hotel": "Hotel",
+    "guesthouse": "Guesthouse",
+    "hostel": "Hostel",
+    "tutor": "Tutor / Coaching",
+    "driving_school": "Driving school",
+}
 
 
-# ---------------------------------------------------------------------------
-# DDG HTML scrape
-# ---------------------------------------------------------------------------
-
-DDG_HTML = "https://html.duckduckgo.com/html/"
-DDG_LITE = "https://lite.duckduckgo.com/lite/"
-BING     = "https://www.bing.com/search"
-
-
-def _clean_ddg_redirect(href: str) -> str:
-    """
-    DDG wraps result links in something like:
-        //duckduckgo.com/l/?uddg=<percent-encoded>&rut=...
-    Unwrap to the real URL.
-    """
-    if not href:
-        return ""
-    if href.startswith("//"):
-        href = "https:" + href
-    p = urlparse(href)
-    if "duckduckgo.com" in p.netloc and p.path.startswith("/l/"):
-        q = parse_qs(p.query)
-        real = q.get("uddg", [""])[0]
-        if real:
-            return unquote(real)
-    return href
+# domains we drop even when OSM lists them — directories, social, marketplaces
+SKIP_DOMAINS = {
+    "facebook.com", "m.facebook.com", "instagram.com", "twitter.com",
+    "x.com", "linkedin.com", "youtube.com", "pinterest.com",
+    "justdial.com", "sulekha.com", "indiamart.com", "tradeindia.com",
+    "yelp.com", "tripadvisor.com", "tripadvisor.in", "zomato.com",
+    "swiggy.com", "booking.com", "airbnb.com", "agoda.com", "makemytrip.com",
+    "goibibo.com", "urbancompany.com", "urbanclap.com", "wa.me", "whatsapp.com",
+    "linktr.ee", "carrd.co",
+}
 
 
-def _clean_bing_redirect(href: str) -> str:
-    """Bing sometimes wraps with /click?u=... — unwrap when it does."""
-    if not href:
-        return ""
-    p = urlparse(href)
-    if "bing.com" in p.netloc and "click" in p.path:
-        q = parse_qs(p.query)
-        u = q.get("u", [""])[0]
-        if u:
-            return unquote(u)
-    return href
+def _bare_domain(netloc: str) -> str:
+    return netloc.lower().lstrip(".").removeprefix("www.")
+
+
+def _is_skipped(url: str) -> bool:
+    try:
+        p = urlparse(url)
+        if not p.netloc:
+            return True
+        bare = _bare_domain(p.netloc)
+        for sd in SKIP_DOMAINS:
+            if bare == sd or bare.endswith("." + sd):
+                return True
+        return False
+    except Exception:
+        return True
 
 
 def _homepage(url: str) -> str:
-    """Strip path/query/fragment — we want the site root for scraping."""
+    """Normalize to scheme://host (strip path, query, fragment)."""
     try:
+        if not url:
+            return ""
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
         p = urlparse(url)
         if not p.scheme or not p.netloc:
             return ""
@@ -229,289 +212,266 @@ def _homepage(url: str) -> str:
         return ""
 
 
-def _bare_domain(netloc: str) -> str:
-    return netloc.lower().lstrip(".").removeprefix("www.")
+# ---------------------------------------------------------------------------
+# IP geolocation — for the "centre map on my location" button
+# ---------------------------------------------------------------------------
 
-
-def _is_skipped(netloc: str) -> bool:
-    bare = _bare_domain(netloc)
-    if not bare:
-        return True
-    for sd in SKIP_DOMAINS:
-        if bare == sd or bare.endswith("." + sd):
-            return True
-    for suf in SKIP_TLD_SUFFIXES:
-        if bare.endswith(suf):
-            return True
-    return False
-
-
-def _passes_country_filter(netloc: str, country: str) -> bool:
+def geolocate_ip(*, timeout: int = 8) -> Optional[dict]:
     """
-    If `country` is set (e.g. 'in'), keep only domains likely to be from
-    that country. We accept the country ccTLD (.in, .co.in, .org.in, etc.)
-    and also generic .com sites — most Indian SMBs use a .com domain, so
-    a hard ccTLD-only filter would lose too many real prospects. Hard-rejects
-    foreign ccTLDs we have no business pitching ("agency in India" pitch
-    to a .de or .au site doesn't land).
+    Returns {lat, lng, city, region, country, country_code} or None.
+
+    Uses ipapi.co (no key, free for ~1000 req/day). We accept None silently
+    on any error — the UI just falls back to a hard-coded city.
     """
-    if not country:
-        return True
-    bare = _bare_domain(netloc)
-    if not bare:
-        return False
-    # foreign ccTLDs to reject (when country='in')
-    foreign_ccs = {
-        "us", "uk", "co.uk", "au", "com.au", "ca", "de", "fr", "it", "es",
-        "nl", "ru", "cn", "jp", "kr", "br", "mx", "za", "ng", "ae", "sg",
-        "my", "ph", "id", "tw", "hk", "pk", "bd", "lk", "np",
-    }
-    if country == "in":
-        # accept obvious-Indian
-        if bare.endswith(".in"):
-            return True
-        # reject obvious-foreign
-        for fc in foreign_ccs:
-            if bare.endswith("." + fc):
-                return False
-        # gTLDs (.com .org .net .biz .co .io) — keep, may still be Indian
-        return True
-    # default: only accept the country TLD
-    return bare.endswith("." + country)
-
-
-def _search_web(query: str, *, timeout: int = 20) -> list[dict]:
-    """
-    Returns list of {"url": homepage, "title": ..., "snippet": ...}.
-    Tries DDG (HTML, then Lite) and falls back to Bing.
-    Raises only if every engine fails.
-    """
-    errors: list[str] = []
-
-    # 1. DDG HTML — try GET then POST (POST is what their form uses but
-    # GET often slips past their soft anti-bot 202 gate).
-    for endpoint in (DDG_HTML, DDG_LITE):
-        for method in ("GET", "POST"):
-            try:
-                if method == "GET":
-                    r = requests.get(
-                        endpoint, params={"q": query, "kl": "in-en"},
-                        headers=HEADERS, timeout=timeout, allow_redirects=True,
-                    )
-                else:
-                    r = requests.post(
-                        endpoint, data={"q": query, "kl": "in-en"},
-                        headers=HEADERS, timeout=timeout, allow_redirects=True,
-                    )
-                if r.status_code != 200:
-                    errors.append(f"{endpoint} {method}: HTTP {r.status_code}")
-                    continue
-                results = _parse_ddg_html(r.text)
-                if results:
-                    return results
-                errors.append(f"{endpoint} {method}: 0 parsed results")
-            except requests.RequestException as e:
-                errors.append(f"{endpoint} {method}: {e}")
-
-    # 2. Bing fallback
     try:
         r = requests.get(
-            BING, params={"q": query, "cc": "IN", "setlang": "en-IN"},
-            headers=HEADERS, timeout=timeout, allow_redirects=True,
+            "https://ipapi.co/json/",
+            headers=HEADERS, timeout=timeout,
         )
-        if r.status_code == 200:
-            results = _parse_bing_html(r.text)
-            if results:
-                return results
-            errors.append("bing: 0 parsed results")
-        else:
-            errors.append(f"bing: HTTP {r.status_code}")
-    except requests.RequestException as e:
-        errors.append(f"bing: {e}")
-
-    raise RuntimeError(" | ".join(errors) or "no results")
-
-
-def _parse_bing_html(html: str) -> list[dict]:
-    """
-    Bing's modern markup keeps organic results in li.b_algo, but the visible
-    link is often inside an h2 > a OR is reconstructable from the breadcrumb
-    <cite> tag (which shows e.g. 'https://www.fitness.com' or
-    'https://www.healthline.com › fitness').
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    out: list[dict] = []
-    for li in soup.select("li.b_algo"):
-        # title — try h2, fall back to first text-y anchor
-        title = ""
-        h2 = li.find("h2")
-        if h2:
-            title = h2.get_text(" ", strip=True)
-        if not title:
-            a = li.find("a")
-            if a:
-                title = a.get_text(" ", strip=True)
-
-        # URL — prefer the cite tag's first chunk (Bing renders breadcrumbs
-        # with the U+203A ›  separator). The cite text often contains
-        # display whitespace ("https:// www.example.com") that needs squashing.
-        href = ""
-        cite = li.find("cite")
-        if cite:
-            cite_text = cite.get_text("", strip=True)  # no separator at all
-            cite_text = re.sub(r"\s+", "", cite_text)
-            first = re.split(r"[›>]", cite_text, maxsplit=1)[0]
-            if first.startswith("http"):
-                href = first
-            elif first:
-                href = "https://" + first.lstrip("/")
-        # fall back: any non-bing anchor href
-        if not href:
-            for a in li.find_all("a", href=True):
-                cleaned = _clean_bing_redirect(a["href"])
-                if cleaned.startswith("http") and "bing.com" not in cleaned:
-                    href = cleaned
-                    break
-
-        # snippet
-        snippet = ""
-        cap = li.select_one(".b_caption p, .b_snippet, .b_paractl, p")
-        if cap:
-            snippet = cap.get_text(" ", strip=True)
-
-        if href:
-            out.append({"url": href, "title": title, "snippet": snippet})
-    return out
-
-
-def _parse_ddg_html(html: str) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    out: list[dict] = []
-
-    # html endpoint:  div.result__body a.result__a + a.result__snippet
-    for body in soup.select("div.result"):
-        a = body.select_one("a.result__a")
-        snip = body.select_one("a.result__snippet, .result__snippet")
-        if not a:
-            continue
-        href = _clean_ddg_redirect(a.get("href", ""))
-        title = a.get_text(" ", strip=True)
-        snippet = snip.get_text(" ", strip=True) if snip else ""
-        if href:
-            out.append({"url": href, "title": title, "snippet": snippet})
-
-    if out:
-        return out
-
-    # lite endpoint:  a.result-link + td.result-snippet
-    for tr in soup.find_all("tr"):
-        a = tr.find("a", class_="result-link")
-        if not a:
-            continue
-        href = _clean_ddg_redirect(a.get("href", ""))
-        title = a.get_text(" ", strip=True)
-        snip_td = tr.find_next("td", class_="result-snippet")
-        snippet = snip_td.get_text(" ", strip=True) if snip_td else ""
-        if href:
-            out.append({"url": href, "title": title, "snippet": snippet})
-
-    return out
+        if r.status_code != 200:
+            return None
+        d = r.json()
+        if "latitude" not in d or "longitude" not in d:
+            return None
+        return {
+            "lat":          float(d["latitude"]),
+            "lng":          float(d["longitude"]),
+            "city":         d.get("city") or "",
+            "region":       d.get("region") or "",
+            "country":      d.get("country_name") or "",
+            "country_code": (d.get("country_code") or "").lower(),
+        }
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
-# orchestrator
+# Nominatim — geocode a place name to lat/lng
 # ---------------------------------------------------------------------------
 
-def find_leads(
-    category: str,
-    city: str = "",
+_NOMINATIM_LAST_CALL = 0.0  # process-global rate limiter; OSM asks <= 1 req/s
+
+
+def _nominatim_throttle():
+    global _NOMINATIM_LAST_CALL
+    elapsed = time.monotonic() - _NOMINATIM_LAST_CALL
+    if elapsed < 1.1:
+        time.sleep(1.1 - elapsed)
+    _NOMINATIM_LAST_CALL = time.monotonic()
+
+
+def geocode_place(query: str, *, timeout: int = 15,
+                  country_code: str = "in") -> Optional[dict]:
+    """
+    Returns {lat, lng, display_name} for the top Nominatim match, or None.
+    country_code biases the search; pass "" to search globally.
+    """
+    q = (query or "").strip()
+    if not q:
+        return None
+    _nominatim_throttle()
+    try:
+        params = {"q": q, "format": "json", "limit": 1, "addressdetails": 0}
+        if country_code:
+            params["countrycodes"] = country_code
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params=params, headers=HEADERS, timeout=timeout,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not data:
+            return None
+        top = data[0]
+        return {
+            "lat":          float(top["lat"]),
+            "lng":          float(top["lon"]),
+            "display_name": top.get("display_name") or q,
+        }
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Overpass — find businesses near a point
+# ---------------------------------------------------------------------------
+
+# Multiple endpoints so we have a fallback if one is under load.
+OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.openstreetmap.ru/api/interpreter",
+]
+
+
+def _build_overpass_query(lat: float, lng: float, radius_m: int,
+                          category_key: str) -> str:
+    tags = CATEGORY_TAGS.get(category_key)
+    if not tags:
+        raise ValueError(f"unknown category: {category_key!r}")
+
+    # Build a node/way/relation block per tag pair. center for ways/relations.
+    blocks = []
+    for k, v in tags:
+        blocks.append(f'  node["{k}"="{v}"](around:{radius_m},{lat},{lng});')
+        blocks.append(f'  way["{k}"="{v}"](around:{radius_m},{lat},{lng});')
+        blocks.append(f'  relation["{k}"="{v}"](around:{radius_m},{lat},{lng});')
+
+    return (
+        "[out:json][timeout:25];\n"
+        "(\n"
+        + "\n".join(blocks) + "\n"
+        ");\n"
+        "out center tags;\n"
+    )
+
+
+def _element_latlng(el: dict) -> tuple[Optional[float], Optional[float]]:
+    if "lat" in el and "lon" in el:
+        return float(el["lat"]), float(el["lon"])
+    c = el.get("center") or {}
+    if "lat" in c and "lon" in c:
+        return float(c["lat"]), float(c["lon"])
+    return None, None
+
+
+def _format_address(tags: dict) -> str:
+    # Try the friendliest combination first, then fall back.
+    full = tags.get("addr:full") or ""
+    if full:
+        return full
+    parts = []
+    h = tags.get("addr:housenumber")
+    s = tags.get("addr:street")
+    if h and s:
+        parts.append(f"{h} {s}")
+    elif s:
+        parts.append(s)
+    for k in ("addr:suburb", "addr:city", "addr:state", "addr:postcode"):
+        v = tags.get(k)
+        if v:
+            parts.append(v)
+    return ", ".join(parts)
+
+
+def _website_from_tags(tags: dict) -> str:
+    for k in ("website", "contact:website", "url"):
+        v = tags.get(k)
+        if v:
+            return v.strip()
+    return ""
+
+
+def _phone_from_tags(tags: dict) -> str:
+    for k in ("phone", "contact:phone", "mobile"):
+        v = tags.get(k)
+        if v:
+            return v.strip()
+    return ""
+
+
+def _name_from_tags(tags: dict) -> str:
+    for k in ("name:en", "name", "operator", "brand"):
+        v = tags.get(k)
+        if v:
+            return v.strip()[:120]
+    return ""
+
+
+def find_nearby(
+    lat: float, lng: float, radius_m: int, category_key: str,
     *,
-    country: str = "in",
-    max_results: int = 15,
+    require_website: bool = True,
     existing_websites: Optional[set[str]] = None,
+    timeout: int = 30,
     progress: Optional[Callable[[str], None]] = None,
 ) -> FindResult:
     """
-    Run a small bouquet of searches and return a deduped list of partial
-    leads with the homepage URL of each candidate.
+    Query Overpass for all OSM elements matching `category_key` within
+    `radius_m` of (lat, lng). Returns dedup'd FoundLeads.
 
-    Pass `existing_websites` (lowercased homepages) so we don't re-suggest
-    leads you've already imported.
+    By default only elements that have a website tag are returned, since the
+    downstream pipeline (scrape/audit/email) needs a URL.
     """
-    existing = {_homepage(u).lower().rstrip("/")
-                for u in (existing_websites or []) if u}
-    seen: set[str] = set()
-    out: list[FoundLead] = []
     res = FindResult()
-
-    queries = build_queries(category, city, country=country)
+    query = _build_overpass_query(lat, lng, radius_m, category_key)
+    res.queries_run.append(f"{category_key}@({lat:.4f},{lng:.4f}) r={radius_m}m")
 
     def emit(msg: str):
         if progress:
             try: progress(msg)
             except Exception: pass
 
-    for q in queries:
-        if len(out) >= max_results:
-            break
-        res.queries_run.append(q)
-        emit(f"Searching: {q}")
+    existing = {(_homepage(u) or "").lower().rstrip("/")
+                for u in (existing_websites or []) if u}
+
+    data = None
+    last_err = ""
+    for ep in OVERPASS_ENDPOINTS:
+        emit(f"Querying OSM ({urlparse(ep).netloc})...")
         try:
-            hits = _search_web(q)
+            r = requests.post(ep, data={"data": query},
+                              headers={"User-Agent": UA}, timeout=timeout)
+            if r.status_code == 200:
+                data = r.json()
+                break
+            last_err = f"HTTP {r.status_code}"
         except Exception as e:
-            res.errors.append(f"{q!r}: {e}")
+            last_err = str(e)
+        time.sleep(0.6)
+
+    if data is None:
+        res.errors.append(f"overpass failed: {last_err or 'unknown'}")
+        return res
+
+    elements = data.get("elements") or []
+    res.raw_count = len(elements)
+    emit(f"OSM returned {len(elements)} place(s). Filtering...")
+
+    seen_domains: set[str] = set()
+    seen_osm: set[str] = set()
+    leads: list[FoundLead] = []
+
+    for el in elements:
+        osm_id = f"{el.get('type','?')}/{el.get('id','?')}"
+        if osm_id in seen_osm:
+            continue
+        seen_osm.add(osm_id)
+
+        tags = el.get("tags") or {}
+        name = _name_from_tags(tags)
+        if not name:
             continue
 
-        for h in hits:
-            home = _homepage(h["url"])
-            if not home:
-                continue
-            netloc = urlparse(home).netloc
-            if _is_skipped(netloc):
-                continue
-            if not _passes_country_filter(netloc, country):
+        website = _website_from_tags(tags)
+        if require_website and not website:
+            continue
+        home = _homepage(website) if website else ""
+        if require_website:
+            if not home or _is_skipped(home):
                 continue
             key = home.lower().rstrip("/")
-            if key in seen or key in existing:
+            if key in seen_domains or key in existing:
                 continue
-            seen.add(key)
+            seen_domains.add(key)
 
-            name = _name_from_title(h.get("title") or "", netloc)
-            out.append(FoundLead(
-                website=home,
-                business_name=name,
-                description=(h.get("snippet") or "")[:300],
-                source_query=q,
-            ))
-            if len(out) >= max_results:
-                break
+        plat, plng = _element_latlng(el)
+        leads.append(FoundLead(
+            website=home,
+            business_name=name,
+            description=_format_address(tags) or tags.get("description") or "",
+            source_query=res.queries_run[0],
+            lat=plat,
+            lng=plng,
+            address=_format_address(tags),
+            phone=_phone_from_tags(tags),
+            osm_id=osm_id,
+        ))
 
-        # be polite to the search engines — bigger jitter helps avoid
-        # the soft-anti-bot gate that triggers after a burst of requests
-        time.sleep(1.6)
-
-    res.leads = out
-    emit(f"Done. {len(out)} candidate site(s).")
+    res.leads = leads
+    emit(f"Done. {len(leads)} usable lead(s) (had a website).")
     return res
-
-
-# title → business-name guess
-_TITLE_SEP_RE = re.compile(r"\s*[\|\-–—:·•]\s*")
-
-
-def _name_from_title(title: str, netloc: str) -> str:
-    if not title:
-        return _bare_domain(netloc).split(".")[0].title()
-    parts = _TITLE_SEP_RE.split(title)
-    parts = [p.strip() for p in parts if p.strip()]
-    if not parts:
-        return title.strip()
-    # heuristic: the shortest "word-y" chunk is usually the business name
-    candidate = min(parts, key=len)
-    # but if the first chunk is short already, prefer it (more common pattern)
-    if len(parts[0]) <= 40:
-        candidate = parts[0]
-    return candidate[:80]
 
 
 # ---------------------------------------------------------------------------
@@ -519,16 +479,18 @@ def _name_from_title(title: str, netloc: str) -> str:
 # ---------------------------------------------------------------------------
 
 class Finder:
-    """Run find_leads on a worker thread without freezing the UI."""
+    """Run find_nearby on a worker thread without freezing the UI."""
 
-    def __init__(self, category: str, city: str = "", *,
-                 country: str = "in", max_results: int = 15,
+    def __init__(self, *, lat: float, lng: float, radius_m: int,
+                 category_key: str,
+                 require_website: bool = True,
                  existing_websites: Optional[set[str]] = None,
                  progress: Optional[Callable[[str], None]] = None):
-        self.category = category
-        self.city = city
-        self.country = country
-        self.max_results = max_results
+        self.lat = lat
+        self.lng = lng
+        self.radius_m = radius_m
+        self.category_key = category_key
+        self.require_website = require_website
         self.existing_websites = existing_websites or set()
         self.progress = progress
         self._thread: Optional[threading.Thread] = None
@@ -537,10 +499,9 @@ class Finder:
     def start(self, on_done: Callable[[FindResult], None]):
         def run():
             try:
-                self.result = find_leads(
-                    self.category, self.city,
-                    country=self.country,
-                    max_results=self.max_results,
+                self.result = find_nearby(
+                    self.lat, self.lng, self.radius_m, self.category_key,
+                    require_website=self.require_website,
                     existing_websites=self.existing_websites,
                     progress=self.progress,
                 )
@@ -550,3 +511,26 @@ class Finder:
         t = threading.Thread(target=run, daemon=True)
         t.start()
         self._thread = t
+
+
+# ---------------------------------------------------------------------------
+# geometry helpers used by the UI to draw the radius circle on the map
+# ---------------------------------------------------------------------------
+
+def circle_polygon(lat: float, lng: float, radius_m: int,
+                   segments: int = 48) -> list[tuple[float, float]]:
+    """
+    Returns a closed polygon (list of (lat, lng) tuples) approximating a
+    circle of `radius_m` metres around the centre. Used to draw the
+    search-area ring on the map.
+    """
+    # ~111_000 m per degree of latitude; longitude shrinks with cos(lat)
+    deg_lat = radius_m / 111_000.0
+    deg_lng = radius_m / (111_000.0 * max(0.01, math.cos(math.radians(lat))))
+    pts: list[tuple[float, float]] = []
+    for i in range(segments):
+        theta = 2 * math.pi * i / segments
+        pts.append((lat + deg_lat * math.sin(theta),
+                    lng + deg_lng * math.cos(theta)))
+    pts.append(pts[0])
+    return pts

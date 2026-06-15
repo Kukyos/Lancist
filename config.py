@@ -27,6 +27,13 @@ DEFAULTS = {
     # lead-finder defaults (used by lead_finder.py + Find Leads dialog)
     "finder_country":    "in",
     "finder_min_results": 10,
+
+    # map-based finder — last view persisted so the dialog opens where you left it
+    "finder_last_lat":    None,
+    "finder_last_lng":    None,
+    "finder_last_zoom":   12,
+    "finder_last_radius_m": 3000,
+    "finder_last_category": "cafe",
 }
 
 

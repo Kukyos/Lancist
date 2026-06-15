@@ -37,9 +37,14 @@ from config import load as load_config, save as save_config, get_api_key, llm_co
 from paths import APP_DIR
 from cloner import Cloner, CloneResult, slugify
 from demo_writer import write_oryn_md
-from lead_finder import Finder, FindResult, FoundLead
+from lead_finder import (
+    Finder, FindResult, FoundLead,
+    CATEGORY_LABELS, CATEGORY_TAGS,
+    geolocate_ip, geocode_place, circle_polygon,
+)
 import smtp_sender
 import llm
+import tkintermapview
 
 
 theme.setup()
@@ -271,185 +276,422 @@ def _entry(parent, *, show=None, placeholder=""):
 
 class FindLeadsDialog(ctk.CTkToplevel):
     """
-    Scour DuckDuckGo for SMB websites matching a category + city, skip
-    the obvious aggregator/social domains, dedupe against existing leads,
-    and import the user-selected hits straight into leads.json.
+    Map-based lead finder. Drop a pin on the map, pick a business category,
+    set a radius, and we query OpenStreetMap via Overpass for every matching
+    place in that circle. Places with websites become importable leads.
+
+    No API keys — uses Nominatim (geocoding), ipapi.co (IP location), and
+    Overpass (POI search).
     """
+
+    DEFAULT_LAT  = 19.0760     # Mumbai
+    DEFAULT_LNG  = 72.8777
+    DEFAULT_ZOOM = 12
+    MIN_RADIUS_M = 500
+    MAX_RADIUS_M = 25_000
 
     def __init__(self, master):
         super().__init__(master)
         self.master_app = master
         self.title("Find Leads")
-        self.geometry("760x680")
+        self.geometry("1140x740")
+        self.minsize(960, 640)
         self.configure(fg_color=theme.BG)
         self.transient(master)
-        self.grab_set()
         _try_set_window_icon(self)
+
+        cfg = load_config()
 
         self.results: list[FoundLead] = []
         self.checkbox_vars: list[ctk.BooleanVar] = []
+        self._markers: list = []
+        self._radius_polygon = None
+        self._centre_marker = None
         self._finder: Optional[Finder] = None
+        self._last_ip_info: Optional[dict] = None
 
-        ctk.CTkLabel(self, text="Find Leads",
-                     font=theme.font_h1(), text_color=theme.TEXT
-                     ).pack(anchor="w", padx=24, pady=(20, 4))
+        self.centre_lat = float(cfg.get("finder_last_lat") or self.DEFAULT_LAT)
+        self.centre_lng = float(cfg.get("finder_last_lng") or self.DEFAULT_LNG)
+        self.zoom_level = int(cfg.get("finder_last_zoom") or self.DEFAULT_ZOOM)
+        self.radius_m   = int(cfg.get("finder_last_radius_m") or 3000)
+        self.last_category_key = cfg.get("finder_last_category") or "cafe"
+
+        # ---- layout: row 0 header, row 1 main, row 2 status ----
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 8))
+        head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(head, text="Find Leads",
+                     font=theme.font_h1(), text_color=theme.TEXT, anchor="w"
+                     ).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
-            self,
-            text="Sweep the open web for small-business sites worth pitching to. "
-                 "Hits are deduped against your existing leads.",
+            head,
+            text="Drop a pin, choose a category, search OpenStreetMap. Only places "
+                 "with a website are importable — those are the ones we can pitch.",
             font=theme.font_small(), text_color=theme.TEXT_MUTED, anchor="w",
-            wraplength=700, justify="left",
-        ).pack(anchor="w", padx=24, pady=(0, 14))
+            wraplength=900, justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
-        form = ctk.CTkFrame(self, fg_color=theme.SURFACE, corner_radius=8,
-                            border_width=1, border_color=theme.BORDER)
-        form.pack(fill="x", padx=20)
-        form.grid_columnconfigure(1, weight=2)
-        form.grid_columnconfigure(3, weight=1)
+        # ---- main split: map on left, controls + results on right ----
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.grid(row=1, column=0, sticky="nsew", padx=16, pady=(4, 4))
+        body.grid_columnconfigure(0, weight=3)
+        body.grid_columnconfigure(1, weight=2, minsize=380)
+        body.grid_rowconfigure(0, weight=1)
 
-        ctk.CTkLabel(form, text="CATEGORY",
-                     font=theme.font_micro(), text_color=theme.TEXT_MUTED, anchor="w"
-                     ).grid(row=0, column=0, sticky="w", padx=(16, 6), pady=(12, 2))
-        ctk.CTkLabel(form, text="CITY (optional)",
-                     font=theme.font_micro(), text_color=theme.TEXT_MUTED, anchor="w"
-                     ).grid(row=0, column=2, sticky="w", padx=(8, 6), pady=(12, 2))
-        ctk.CTkLabel(form, text="COUNT",
-                     font=theme.font_micro(), text_color=theme.TEXT_MUTED, anchor="w"
-                     ).grid(row=0, column=4, sticky="w", padx=(8, 16), pady=(12, 2))
+        # --- map column ---
+        map_wrap = ctk.CTkFrame(body, fg_color=theme.SURFACE, corner_radius=8,
+                                border_width=1, border_color=theme.BORDER)
+        map_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        map_wrap.grid_rowconfigure(0, weight=1)
+        map_wrap.grid_columnconfigure(0, weight=1)
 
-        self.category_entry = ctk.CTkEntry(
-            form, height=36, placeholder_text="e.g. fitness studio, dentist, salon",
+        self.map_widget = tkintermapview.TkinterMapView(
+            map_wrap, width=400, height=400, corner_radius=8,
+        )
+        self.map_widget.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
+        self.map_widget.set_position(self.centre_lat, self.centre_lng)
+        self.map_widget.set_zoom(self.zoom_level)
+        self.map_widget.add_left_click_map_command(self._on_map_click)
+
+        map_hint = ctk.CTkLabel(
+            map_wrap,
+            text="Left-click anywhere to recentre the search.",
+            text_color=theme.TEXT_MUTED, font=theme.font_small(),
+        )
+        map_hint.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 6))
+
+        # --- right column: controls (top) + results (bottom) ---
+        right = ctk.CTkFrame(body, fg_color="transparent")
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(1, weight=1)
+
+        controls = ctk.CTkFrame(right, fg_color=theme.SURFACE, corner_radius=8,
+                                border_width=1, border_color=theme.BORDER)
+        controls.grid(row=0, column=0, sticky="ew")
+        controls.grid_columnconfigure(0, weight=1)
+
+        # location row
+        ctk.CTkLabel(controls, text="LOCATION", font=theme.font_micro(),
+                     text_color=theme.TEXT_MUTED, anchor="w"
+                     ).grid(row=0, column=0, sticky="w", padx=14, pady=(12, 2))
+
+        loc_row = ctk.CTkFrame(controls, fg_color="transparent")
+        loc_row.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 8))
+        loc_row.grid_columnconfigure(0, weight=1)
+        self.location_label = ctk.CTkLabel(
+            loc_row,
+            text=f"Centre: {self.centre_lat:.4f}, {self.centre_lng:.4f}",
+            text_color=theme.TEXT, font=theme.font_body(), anchor="w",
+        )
+        self.location_label.grid(row=0, column=0, sticky="ew")
+        self.use_ip_btn = ctk.CTkButton(
+            loc_row, text="Use my IP", width=92, height=28,
+            fg_color="transparent", border_width=1, border_color=theme.BORDER,
+            text_color=theme.TEXT_DIM, hover_color=theme.SURFACE_HI,
+            command=self._on_use_ip,
+        )
+        self.use_ip_btn.grid(row=0, column=1, padx=(6, 0))
+
+        # geocoder row
+        geo_row = ctk.CTkFrame(controls, fg_color="transparent")
+        geo_row.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 12))
+        geo_row.grid_columnconfigure(0, weight=1)
+        self.geocode_entry = ctk.CTkEntry(
+            geo_row, height=32, placeholder_text="Jump to: city, neighbourhood, address…",
             fg_color=theme.BG, border_color=theme.BORDER, text_color=theme.TEXT,
         )
-        self.category_entry.grid(row=1, column=0, columnspan=2,
-                                 sticky="ew", padx=(16, 6), pady=(0, 12))
-
-        self.city_entry = ctk.CTkEntry(
-            form, height=36, placeholder_text="e.g. Mumbai",
-            fg_color=theme.BG, border_color=theme.BORDER, text_color=theme.TEXT,
+        self.geocode_entry.grid(row=0, column=0, sticky="ew")
+        self.geocode_entry.bind("<Return>", lambda _e: self._on_geocode())
+        self.geocode_btn = ctk.CTkButton(
+            geo_row, text="Go", width=58, height=32,
+            fg_color="transparent", border_width=1, border_color=theme.BORDER_HI,
+            text_color=theme.TEXT, hover_color=theme.SURFACE_HI,
+            command=self._on_geocode,
         )
-        self.city_entry.grid(row=1, column=2, columnspan=2,
-                             sticky="ew", padx=(8, 6), pady=(0, 12))
+        self.geocode_btn.grid(row=0, column=1, padx=(6, 0))
 
-        self.count_var = ctk.StringVar(
-            value=str(load_config().get("finder_min_results", 15)))
-        self.count_entry = ctk.CTkEntry(
-            form, height=36, textvariable=self.count_var, width=80,
-            fg_color=theme.BG, border_color=theme.BORDER, text_color=theme.TEXT,
+        # category
+        ctk.CTkLabel(controls, text="CATEGORY", font=theme.font_micro(),
+                     text_color=theme.TEXT_MUTED, anchor="w"
+                     ).grid(row=3, column=0, sticky="w", padx=14, pady=(4, 2))
+        # label list keeps a stable order (insertion order of CATEGORY_LABELS)
+        label_to_key = {v: k for k, v in CATEGORY_LABELS.items()}
+        self._label_to_key = label_to_key
+        labels = list(CATEGORY_LABELS.values())
+        default_label = CATEGORY_LABELS.get(self.last_category_key, labels[0])
+        self.category_var = ctk.StringVar(value=default_label)
+        ctk.CTkOptionMenu(
+            controls, values=labels, variable=self.category_var,
+            fg_color=theme.BG, button_color=theme.SURFACE_HI,
+            button_hover_color=theme.BORDER_HI, text_color=theme.TEXT,
+            dropdown_fg_color=theme.SURFACE, dropdown_text_color=theme.TEXT,
+            dropdown_hover_color=theme.SURFACE_HI,
+        ).grid(row=4, column=0, sticky="ew", padx=14, pady=(0, 10))
+
+        # radius
+        ctk.CTkLabel(controls, text="RADIUS", font=theme.font_micro(),
+                     text_color=theme.TEXT_MUTED, anchor="w"
+                     ).grid(row=5, column=0, sticky="w", padx=14, pady=(0, 2))
+        rad_row = ctk.CTkFrame(controls, fg_color="transparent")
+        rad_row.grid(row=6, column=0, sticky="ew", padx=14, pady=(0, 12))
+        rad_row.grid_columnconfigure(0, weight=1)
+        self.radius_slider = ctk.CTkSlider(
+            rad_row,
+            from_=self.MIN_RADIUS_M, to=self.MAX_RADIUS_M,
+            number_of_steps=(self.MAX_RADIUS_M - self.MIN_RADIUS_M) // 500,
+            command=self._on_radius_change,
+            fg_color=theme.BORDER, progress_color=theme.ACCENT,
+            button_color=theme.ACCENT, button_hover_color=theme.ACCENT_DIM,
         )
-        self.count_entry.grid(row=1, column=4, sticky="w",
-                              padx=(8, 16), pady=(0, 12))
+        self.radius_slider.set(self.radius_m)
+        self.radius_slider.grid(row=0, column=0, sticky="ew")
+        self.radius_label = ctk.CTkLabel(
+            rad_row, text=self._radius_text(),
+            text_color=theme.TEXT, font=theme.font_body(), width=72,
+        )
+        self.radius_label.grid(row=0, column=1, padx=(8, 0))
 
-        # search button + progress + status
-        bar = ctk.CTkFrame(self, fg_color="transparent")
-        bar.pack(fill="x", padx=20, pady=(10, 4))
-        bar.grid_columnconfigure(0, weight=1)
+        # search button + status
+        self.find_status = ctk.CTkLabel(
+            controls, text="", text_color=theme.TEXT_DIM,
+            font=theme.font_small(), anchor="w", wraplength=380, justify="left",
+        )
+        self.find_status.grid(row=7, column=0, sticky="ew", padx=14, pady=(0, 6))
+
         self.search_btn = ctk.CTkButton(
-            bar, text="Search", width=160, height=34,
+            controls, text="Search this area", height=36,
             fg_color=theme.ACCENT, text_color="#000000",
             hover_color=theme.ACCENT_DIM, command=self._on_search,
         )
-        self.search_btn.grid(row=0, column=1, sticky="e")
-        self.find_status = ctk.CTkLabel(
-            bar, text="", text_color=theme.TEXT_DIM,
-            font=theme.font_small(), anchor="w",
-        )
-        self.find_status.grid(row=0, column=0, sticky="w")
+        self.search_btn.grid(row=8, column=0, sticky="ew", padx=14, pady=(0, 12))
 
         self.find_progress = ctk.CTkProgressBar(
-            self, height=4, progress_color=theme.ACCENT,
+            controls, height=4, progress_color=theme.ACCENT,
             fg_color=theme.BORDER, mode="indeterminate",
         )
-        self.find_progress.pack(fill="x", padx=20, pady=(4, 8))
+        self.find_progress.grid(row=9, column=0, sticky="ew", padx=14, pady=(0, 10))
         self.find_progress.set(0)
-        self.find_progress.pack_forget()
+        self.find_progress.grid_remove()
 
-        # results list
-        ctk.CTkLabel(self, text="RESULTS",
-                     font=theme.font_micro(), text_color=theme.TEXT_MUTED, anchor="w"
-                     ).pack(anchor="w", padx=24, pady=(6, 4))
+        # results pane
+        results_wrap = ctk.CTkFrame(right, fg_color=theme.SURFACE, corner_radius=8,
+                                    border_width=1, border_color=theme.BORDER)
+        results_wrap.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        results_wrap.grid_columnconfigure(0, weight=1)
+        results_wrap.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(results_wrap, text="RESULTS", font=theme.font_micro(),
+                     text_color=theme.TEXT_MUTED, anchor="w"
+                     ).grid(row=0, column=0, sticky="w", padx=14, pady=(10, 4))
         self.results_frame = ctk.CTkScrollableFrame(
-            self, fg_color="transparent",
+            results_wrap, fg_color="transparent",
             scrollbar_button_color=theme.BORDER,
             scrollbar_button_hover_color=theme.BORDER_HI,
         )
-        self.results_frame.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+        self.results_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
         ctk.CTkLabel(self.results_frame,
                      text="(run a search to see candidates)",
                      text_color=theme.TEXT_MUTED, font=theme.font_small()
                      ).pack(anchor="w", padx=8, pady=12)
 
-        # import bar
-        act = ctk.CTkFrame(self, fg_color="transparent")
-        act.pack(fill="x", padx=20, pady=(0, 16))
+        act = ctk.CTkFrame(results_wrap, fg_color="transparent")
+        act.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
         act.grid_columnconfigure(0, weight=1)
         self.import_status = ctk.CTkLabel(
             act, text="", text_color=theme.TEXT_DIM,
-            font=theme.font_small(), anchor="w",
+            font=theme.font_small(), anchor="w", wraplength=200, justify="left",
         )
         self.import_status.grid(row=0, column=0, sticky="w")
-
-        ctk.CTkButton(
-            act, text="Close", width=92, height=32,
-            fg_color="transparent", border_width=1, border_color=theme.BORDER,
-            text_color=theme.TEXT_DIM, hover_color=theme.SURFACE_HI,
-            command=self.destroy,
-        ).grid(row=0, column=1, padx=(6, 6))
         self.select_all_btn = ctk.CTkButton(
-            act, text="Select all", width=110, height=32,
+            act, text="Select all", width=92, height=30,
             fg_color="transparent", border_width=1, border_color=theme.BORDER,
             text_color=theme.TEXT_DIM, hover_color=theme.SURFACE_HI,
             command=self._toggle_all,
         )
-        self.select_all_btn.grid(row=0, column=2, padx=(0, 6))
+        self.select_all_btn.grid(row=0, column=1, padx=(6, 6))
+        self.select_all_btn.configure(state="disabled")
         self.import_btn = ctk.CTkButton(
-            act, text="Import selected", width=160, height=32,
+            act, text="Import selected", width=140, height=30,
             fg_color=theme.ACCENT, text_color="#000000",
             hover_color=theme.ACCENT_DIM, command=self._on_import,
         )
-        self.import_btn.grid(row=0, column=3)
+        self.import_btn.grid(row=0, column=2)
         self.import_btn.configure(state="disabled")
-        self.select_all_btn.configure(state="disabled")
 
-    # ------------------- search -------------------
+        # ---- footer status ----
+        foot = ctk.CTkFrame(self, fg_color="transparent")
+        foot.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 14))
+        foot.grid_columnconfigure(0, weight=1)
+        self.footer_label = ctk.CTkLabel(
+            foot, text="Tiles: OpenStreetMap. Geocoding: Nominatim. POI: Overpass.",
+            text_color=theme.TEXT_MUTED, font=theme.font_small(), anchor="w",
+        )
+        self.footer_label.grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(
+            foot, text="Close", width=80, height=28,
+            fg_color="transparent", border_width=1, border_color=theme.BORDER,
+            text_color=theme.TEXT_DIM, hover_color=theme.SURFACE_HI,
+            command=self._on_close,
+        ).grid(row=0, column=1, sticky="e")
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(60, self._redraw_overlays)
+        # auto-fetch IP location only if there's no stored centre yet
+        if cfg.get("finder_last_lat") is None:
+            self.after(200, self._on_use_ip)
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+
+    def _radius_text(self) -> str:
+        if self.radius_m >= 1000:
+            return f"{self.radius_m/1000:.1f} km"
+        return f"{self.radius_m} m"
+
+    def _set_status(self, msg: str, color: str = None):
+        self.find_status.configure(
+            text=msg, text_color=color or theme.TEXT_DIM)
+
+    def _category_key(self) -> str:
+        return self._label_to_key.get(self.category_var.get(), "cafe")
+
+    # ------------------------------------------------------------------
+    # map overlays
+    # ------------------------------------------------------------------
+
+    def _redraw_overlays(self):
+        """Clear and redraw the centre pin + radius circle."""
+        try:
+            if self._centre_marker:
+                self._centre_marker.delete()
+        except Exception:
+            pass
+        self._centre_marker = self.map_widget.set_marker(
+            self.centre_lat, self.centre_lng,
+            text="search centre",
+            marker_color_circle=theme.ACCENT,
+            marker_color_outside=theme.ACCENT_DIM,
+        )
+
+        try:
+            if self._radius_polygon:
+                self._radius_polygon.delete()
+        except Exception:
+            pass
+        pts = circle_polygon(self.centre_lat, self.centre_lng, self.radius_m)
+        self._radius_polygon = self.map_widget.set_polygon(
+            pts,
+            outline_color=theme.ACCENT,
+            fill_color=None,
+            border_width=2,
+        )
+
+    def _on_map_click(self, coords):
+        try:
+            self.centre_lat, self.centre_lng = float(coords[0]), float(coords[1])
+        except Exception:
+            return
+        self.location_label.configure(
+            text=f"Centre: {self.centre_lat:.4f}, {self.centre_lng:.4f}")
+        self._redraw_overlays()
+
+    def _on_radius_change(self, value):
+        # snap to 500m steps
+        self.radius_m = max(self.MIN_RADIUS_M,
+                            min(self.MAX_RADIUS_M, int(round(value / 500) * 500)))
+        self.radius_label.configure(text=self._radius_text())
+        self._redraw_overlays()
+
+    # ------------------------------------------------------------------
+    # location helpers
+    # ------------------------------------------------------------------
+
+    def _on_use_ip(self):
+        self.use_ip_btn.configure(state="disabled", text="…")
+        def worker():
+            info = geolocate_ip()
+            self.after(0, self._after_ip, info)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_ip(self, info: Optional[dict]):
+        self.use_ip_btn.configure(state="normal", text="Use my IP")
+        if not info:
+            self._set_status("IP geolocation failed (offline?).", theme.SEV_HIGH_BG)
+            return
+        self._last_ip_info = info
+        self.centre_lat = info["lat"]
+        self.centre_lng = info["lng"]
+        self.zoom_level = 12
+        self.map_widget.set_position(self.centre_lat, self.centre_lng)
+        self.map_widget.set_zoom(self.zoom_level)
+        city = info.get("city") or "(unknown city)"
+        country = info.get("country") or ""
+        self.location_label.configure(
+            text=f"{city}, {country} — {self.centre_lat:.4f}, {self.centre_lng:.4f}")
+        self._set_status(f"Centred on {city}.", theme.TEXT)
+        self._redraw_overlays()
+
+    def _on_geocode(self):
+        q = self.geocode_entry.get().strip()
+        if not q:
+            return
+        self.geocode_btn.configure(state="disabled", text="…")
+        self._set_status(f"Looking up '{q}'…", theme.TEXT_DIM)
+        cc = load_config().get("finder_country", "in") or ""
+        def worker():
+            res = geocode_place(q, country_code=cc)
+            self.after(0, self._after_geocode, q, res)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_geocode(self, query: str, res: Optional[dict]):
+        self.geocode_btn.configure(state="normal", text="Go")
+        if not res:
+            self._set_status(f"No match for '{query}'.", theme.SEV_HIGH_BG)
+            return
+        self.centre_lat = res["lat"]
+        self.centre_lng = res["lng"]
+        self.zoom_level = 13
+        self.map_widget.set_position(self.centre_lat, self.centre_lng)
+        self.map_widget.set_zoom(self.zoom_level)
+        self.location_label.configure(text=res["display_name"][:80])
+        self._set_status("Centred. Hit Search to find businesses here.", theme.TEXT)
+        self._redraw_overlays()
+
+    # ------------------------------------------------------------------
+    # search
+    # ------------------------------------------------------------------
 
     def _on_search(self):
-        category = self.category_entry.get().strip()
-        if not category:
-            self.find_status.configure(
-                text="Type a category (e.g. 'dentist').",
-                text_color=theme.SEV_HIGH_BG)
-            return
-        city = self.city_entry.get().strip()
-        try:
-            count = max(3, min(50, int(self.count_var.get().strip() or "15")))
-        except ValueError:
-            count = 15
-
+        category_key = self._category_key()
         existing = {
             (l.get("website") or "").lower().rstrip("/")
             for l in load_leads()
         }
         existing.discard("")
 
+        # clear UI
         for w in self.results_frame.winfo_children(): w.destroy()
         self.results = []
         self.checkbox_vars = []
+        self._clear_result_markers()
         self.import_btn.configure(state="disabled")
         self.select_all_btn.configure(state="disabled")
         self.search_btn.configure(state="disabled", text="Searching…")
-        self.find_progress.pack(fill="x", padx=20, pady=(4, 8))
+        self.find_progress.grid()
         self.find_progress.start()
 
         def on_progress(msg: str):
-            self.after(0, lambda: self.find_status.configure(
-                text=msg, text_color=theme.TEXT_DIM))
+            self.after(0, self._set_status, msg, theme.TEXT_DIM)
 
-        cfg = load_config()
         finder = Finder(
-            category=category, city=city,
-            country=cfg.get("finder_country", "in"),
-            max_results=count,
+            lat=self.centre_lat, lng=self.centre_lng,
+            radius_m=self.radius_m, category_key=category_key,
+            require_website=True,
             existing_websites=existing,
             progress=on_progress,
         )
@@ -462,41 +704,58 @@ class FindLeadsDialog(ctk.CTkToplevel):
 
     def _after_search(self, result: FindResult):
         self.find_progress.stop()
-        self.find_progress.pack_forget()
-        self.search_btn.configure(state="normal", text="Search")
+        self.find_progress.grid_remove()
+        self.search_btn.configure(state="normal", text="Search this area")
 
         for w in self.results_frame.winfo_children(): w.destroy()
         self.results = result.leads
         self.checkbox_vars = []
+        self._clear_result_markers()
 
         if not self.results:
-            err = result.errors[0] if result.errors else "no SMB sites matched"
-            self.find_status.configure(
-                text=f"No results. ({err})",
-                text_color=theme.SEV_HIGH_BG)
+            err = result.errors[0] if result.errors else "no matches"
+            extra = (f"OSM had {result.raw_count} place(s) but none had a website tag."
+                     if result.raw_count and not result.errors
+                     else f"({err})")
+            self._set_status(f"No usable leads. {extra}", theme.SEV_HIGH_BG)
             ctk.CTkLabel(
                 self.results_frame,
-                text="Try a more specific category, add a city, or drop the city.",
-                text_color=theme.TEXT_MUTED, font=theme.font_small()
+                text="Try a bigger radius, a different category, or recentre the map.",
+                text_color=theme.TEXT_MUTED, font=theme.font_small(),
+                wraplength=320, justify="left",
             ).pack(anchor="w", padx=8, pady=12)
             return
 
-        self.find_status.configure(
-            text=f"Found {len(self.results)} candidate site(s) across "
-                 f"{len(result.queries_run)} querie(s).",
-            text_color=theme.TEXT)
+        self._set_status(
+            f"Found {len(self.results)} usable lead(s) "
+            f"(OSM saw {result.raw_count} place(s) in the area).",
+            theme.TEXT)
 
-        for lead in self.results:
+        for i, lead in enumerate(self.results):
             var = ctk.BooleanVar(value=True)
             self.checkbox_vars.append(var)
-            self._render_result_card(lead, var)
+            self._render_result_card(i, lead, var)
+            if lead.lat is not None and lead.lng is not None:
+                m = self.map_widget.set_marker(
+                    lead.lat, lead.lng,
+                    text=lead.business_name[:40],
+                    marker_color_circle=theme.TEXT,
+                    marker_color_outside=theme.ACCENT,
+                )
+                self._markers.append(m)
 
         self.import_btn.configure(state="normal")
         self.select_all_btn.configure(state="normal", text="Deselect all")
 
-    def _render_result_card(self, lead: FoundLead, var: ctk.BooleanVar):
+    def _clear_result_markers(self):
+        for m in self._markers:
+            try: m.delete()
+            except Exception: pass
+        self._markers = []
+
+    def _render_result_card(self, idx: int, lead: FoundLead, var: ctk.BooleanVar):
         card = ctk.CTkFrame(
-            self.results_frame, fg_color=theme.SURFACE, corner_radius=6,
+            self.results_frame, fg_color=theme.BG, corner_radius=6,
             border_width=1, border_color=theme.BORDER,
         )
         card.pack(fill="x", padx=4, pady=3)
@@ -507,26 +766,37 @@ class FindLeadsDialog(ctk.CTkToplevel):
             fg_color=theme.ACCENT, hover_color=theme.ACCENT_DIM,
             border_color=theme.BORDER_HI, checkmark_color="#000000",
         )
-        cb.grid(row=0, column=0, rowspan=2, sticky="nw", padx=(10, 6), pady=10)
+        cb.grid(row=0, column=0, rowspan=3, sticky="nw", padx=(8, 4), pady=8)
 
         ctk.CTkLabel(
             card, text=lead.business_name, anchor="w",
             font=theme.font_h2(), text_color=theme.TEXT,
-        ).grid(row=0, column=1, sticky="ew", padx=(0, 12), pady=(10, 0))
+            wraplength=260, justify="left",
+        ).grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
         ctk.CTkLabel(
             card, text=lead.website, anchor="w",
             text_color=theme.TEXT_DIM, font=theme.font_small(),
-        ).grid(row=1, column=1, sticky="ew", padx=(0, 12))
-        if lead.description:
+            wraplength=260, justify="left",
+        ).grid(row=1, column=1, sticky="ew", padx=(0, 8))
+        if lead.address:
             ctk.CTkLabel(
-                card, text=lead.description, anchor="w",
+                card, text=lead.address, anchor="w",
                 text_color=theme.TEXT_MUTED, font=theme.font_small(),
-                wraplength=560, justify="left",
-            ).grid(row=2, column=1, sticky="ew", padx=(0, 12), pady=(2, 10))
+                wraplength=260, justify="left",
+            ).grid(row=2, column=1, sticky="ew", padx=(0, 8), pady=(2, 6))
+
+        # clicking the card jumps the map to that lead
+        if lead.lat is not None and lead.lng is not None:
+            def goto(_e=None, lat=lead.lat, lng=lead.lng):
+                self.map_widget.set_position(lat, lng)
+                self.map_widget.set_zoom(max(14, self.map_widget.zoom))
+            card.bind("<Button-1>", goto)
+            for child in card.winfo_children():
+                if isinstance(child, ctk.CTkLabel):
+                    child.bind("<Button-1>", goto)
 
     def _toggle_all(self):
         if not self.checkbox_vars: return
-        # if any are off, turn all on; else turn all off
         any_off = any(not v.get() for v in self.checkbox_vars)
         new = any_off
         for v in self.checkbox_vars:
@@ -542,20 +812,33 @@ class FindLeadsDialog(ctk.CTkToplevel):
                 text="Tick at least one candidate.",
                 text_color=theme.SEV_HIGH_BG)
             return
-
-        from store import upsert_lead as _upsert
         n = 0
         for c in chosen:
-            _upsert(c.to_dict())
+            upsert_lead(c.to_dict())
             n += 1
         self.import_status.configure(
-            text=f"Imported {n} lead(s). Open them in the sidebar to analyze.",
-            text_color=theme.TEXT)
-        # nudge the main window
+            text=f"Imported {n} lead(s).", text_color=theme.TEXT)
         try:
             self.master_app.refresh_list()
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # cleanup
+    # ------------------------------------------------------------------
+
+    def _on_close(self):
+        try:
+            save_config({
+                "finder_last_lat":       self.centre_lat,
+                "finder_last_lng":       self.centre_lng,
+                "finder_last_zoom":      int(self.map_widget.zoom),
+                "finder_last_radius_m":  int(self.radius_m),
+                "finder_last_category":  self._category_key(),
+            })
+        except Exception:
+            pass
+        self.destroy()
 
 
 # ---------------------------------------------------------------------------
